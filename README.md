@@ -13,6 +13,7 @@ With NVM, run `nvm use` in the project directory to select the version pinned in
 
 ```sh
 npm install
+npx playwright install chromium
 npm run login
 ```
 
@@ -47,3 +48,18 @@ Then start a new Codex session and ask it to call `get_login_status`. The server
 `search_marketplace` supports an optional Marketplace city slug; minimum and maximum prices; listing age; item condition; local pickup or shipping; newest, nearest, or price sorting; and a radius of 1, 2, 5, 10, 20, 40, 60, 80, 100, 250, or 500 miles. Without a city slug, searches use the location saved in the browser profile. Facebook treats radius filtering as a search preference and may occasionally include recommendations from outside it.
 
 The tools do not expose cookies or profile files and do not provide actions for messaging, buying, selling, saving, or modifying Facebook data.
+
+## Operational notes
+
+- Facebook can change its Marketplace markup without notice. If searches unexpectedly return no listings, confirm the same search works in the opened Chromium window.
+- Facebook may include sponsored or out-of-radius recommendations even when filters are present.
+- Tool calls are serialized within one MCP process. Chromium closes after every call, allowing other Codex sessions to use the profile afterward; simultaneous calls from separate sessions can still produce a temporary profile-in-use error.
+- Re-run `npm run login` if Facebook expires the saved session or requests verification.
+
+## Safety
+
+The MCP surface is intentionally narrow and read-only. Listing URLs are restricted to HTTPS Facebook Marketplace item paths, city slugs are validated before URL construction, result counts and extracted text are bounded, and all tools advertise MCP `readOnlyHint`. Never remove `data/browser-profile/` from `.gitignore` or share that directory.
+
+## License
+
+ISC
