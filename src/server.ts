@@ -51,20 +51,48 @@ function jsonResult(value: unknown) {
 }
 
 function errorResult(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  let message = "Marketplace request failed. Check the local Chromium window and try again.";
+  if (/existing browser session|processsingleton|profile.*in use/i.test(rawMessage)) {
+    message = "The dedicated browser profile is already in use. Close the login browser or wait for the other Marketplace tool call to finish.";
+  } else if (/executable doesn't exist|browser.*not found/i.test(rawMessage)) {
+    message = "Playwright Chromium is not installed. Run: npx playwright install chromium";
+  } else if (/facebook is requesting login/i.test(rawMessage)) {
+    message = "Facebook is requesting login in the dedicated browser profile. Run: npm run login";
+  } else if (error instanceof Error && !rawMessage.includes(profilePath)) {
+    message = rawMessage;
+  }
   return {
     isError: true,
     content: [{ type: "text" as const, text: message }],
   };
 }
 
-async function waitForMarketplace(page: Page): Promise<void> {
+async function isLoginRequired(page: Page): Promise<boolean> {
+  const loginFormVisible = await page
+    .locator('input[name="email"], form[action*="login"]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+  return loginFormVisible || page.url().includes("/login") || page.url().includes("/checkpoint/");
+}
+
+async function requireLogin(page: Page): Promise<void> {
+  if (await isLoginRequired(page)) {
+    throw new Error("Facebook is requesting login.");
+  }
+}
+
+async function waitForMarketplace(page: Page): Promise<boolean> {
   await page.waitForLoadState("domcontentloaded");
-  await page.locator('a[href*="/marketplace/item/"]').first().waitFor({
-    state: "attached",
-    timeout: 20_000,
-  }).catch(() => undefined);
+  const foundListing = await page
+    .locator('a[href*="/marketplace/item/"]')
+    .first()
+    .waitFor({ state: "attached", timeout: 20_000 })
+    .then(() => true)
+    .catch(() => false);
   await page.waitForTimeout(500);
+  return foundListing;
 }
 
 const server = new McpServer({
@@ -91,12 +119,7 @@ server.registerTool(
       return jsonResult(
         await withPage(async (page) => {
           await page.goto(`${marketplaceOrigin}/marketplace/`, { waitUntil: "domcontentloaded" });
-          const loginFormVisible = await page
-            .locator('input[name="email"], form[action*="login"]')
-            .first()
-            .isVisible()
-            .catch(() => false);
-          const authenticated = !loginFormVisible && !page.url().includes("/login");
+          const authenticated = !(await isLoginRequired(page));
           return {
             authenticated,
             marketplaceUrl: page.url().startsWith(`${marketplaceOrigin}/marketplace`),
@@ -185,7 +208,10 @@ server.registerTool(
 
       const listings = await withPage(async (page) => {
         await page.goto(searchUrl.toString(), { waitUntil: "domcontentloaded" });
-        await waitForMarketplace(page);
+        const foundListing = await waitForMarketplace(page);
+        await requireLogin(page);
+
+        if (!foundListing) return [];
 
         return page.locator('a[href*="/marketplace/item/"]').evaluateAll(
           (anchors, resultLimit) => {
@@ -233,6 +259,10 @@ server.registerTool(
           sortBy: sort_by,
         },
         count: listings.length,
+        message:
+          listings.length === 0
+            ? "Facebook returned no visible listings. Try broader or fewer filters."
+            : undefined,
         listings,
       });
     } catch (error) {
@@ -257,6 +287,7 @@ server.registerTool(
       const listing = await withPage(async (page) => {
         await page.goto(safeUrl, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
+        await requireLogin(page);
 
         return page.evaluate(() => {
           const meta = (property: string) =>
