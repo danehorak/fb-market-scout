@@ -16,7 +16,7 @@ npm run login
 
 Log into Facebook in the Chromium window, confirm Marketplace loads, and then close the window. The session is stored under `data/browser-profile`, which is ignored by Git and must never be shared.
 
-Only one process can use the profile at a time. Close the login browser before starting the MCP server.
+Only one process can use the profile at a time. Close the login browser before calling an MCP tool. The server opens Chromium for each tool call and closes it afterward so an idle Codex chat does not keep the profile locked.
 
 ## Run locally
 
@@ -33,7 +33,7 @@ The server uses stdio, so a successful direct run waits silently for an MCP clie
 Run this from a shell where `node --version` reports 20 or newer:
 
 ```sh
-codex mcp add fb-market-scout -- /Users/dane/.nvm/versions/node/v20.20.2/bin/node /Users/dane/Code/Facebook-Marketplace-MCP/dist/server.js
+codex mcp add fb-market-scout -- "$(nvm which 20)" "$(pwd)/dist/server.js"
 ```
 
 Then start a new Codex session and ask it to call `get_login_status`. The server exposes these read-only tools:
@@ -41,5 +41,7 @@ Then start a new Codex session and ask it to call `get_login_status`. The server
 - `get_login_status`
 - `search_marketplace`
 - `get_listing`
+
+`search_marketplace` supports an optional Marketplace city slug; minimum and maximum prices; listing age; item condition; local pickup or shipping; newest, nearest, or price sorting; and a radius of 1, 2, 5, 10, 20, 40, 60, 80, 100, 250, or 500 miles. Without a city slug, searches use the location saved in the browser profile. Facebook treats radius filtering as a search preference and may occasionally include recommendations from outside it.
 
 The tools do not expose cookies or profile files and do not provide actions for messaging, buying, selling, saving, or modifying Facebook data.

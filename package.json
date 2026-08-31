@@ -1,6 +1,6 @@
 {
-  "name": "facebook-marketplace-mcp",
-  "version": "1.0.0",
+  "name": "fb-market-scout",
+  "version": "0.1.0",
   "description": "A local, read-only Facebook Marketplace MCP server",
   "main": "dist/server.js",
   "scripts": {
@@ -8,6 +8,7 @@
     "login": "tsx src/login.ts",
     "mcp": "tsx src/server.ts",
     "start": "node dist/server.js",
+    "test": "npm run build && node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [],

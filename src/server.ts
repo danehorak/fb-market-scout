@@ -2,14 +2,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { chromium, type BrowserContext, type Page } from "playwright";
+import { chromium, type Page } from "playwright";
 import { z } from "zod";
+import {
+  assertMarketplaceListingUrl,
+  buildMarketplaceSearchUrl,
+  marketplaceOrigin,
+} from "./marketplace.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const profilePath = path.join(projectRoot, "data", "browser-profile");
-const marketplaceOrigin = "https://www.facebook.com";
+const supportedRadii = [1, 2, 5, 10, 20, 40, 60, 80, 100, 250, 500] as const;
 
-let contextPromise: Promise<BrowserContext> | undefined;
 let operationQueue = Promise.resolve();
 
 type ListingSummary = {
@@ -20,24 +24,18 @@ type ListingSummary = {
   imageAlt?: string;
 };
 
-function getContext(): Promise<BrowserContext> {
-  contextPromise ??= chromium
-    .launchPersistentContext(profilePath, {
-      headless: false,
-      viewport: { width: 1440, height: 900 },
-    })
-    .catch((error: unknown) => {
-      contextPromise = undefined;
-      throw error;
-    });
-  return contextPromise;
-}
-
 async function withPage<T>(operation: (page: Page) => Promise<T>): Promise<T> {
   const run = operationQueue.then(async () => {
-    const context = await getContext();
-    const page = context.pages()[0] ?? (await context.newPage());
-    return operation(page);
+    const context = await chromium.launchPersistentContext(profilePath, {
+      headless: false,
+      viewport: { width: 1440, height: 900 },
+    });
+    try {
+      const page = context.pages()[0] ?? (await context.newPage());
+      return await operation(page);
+    } finally {
+      await context.close().catch(() => undefined);
+    }
   });
   operationQueue = run.then(
     () => undefined,
@@ -58,17 +56,6 @@ function errorResult(error: unknown) {
     isError: true,
     content: [{ type: "text" as const, text: message }],
   };
-}
-
-function assertMarketplaceListingUrl(value: string): string {
-  const url = new URL(value);
-  const allowedHost = url.hostname === "facebook.com" || url.hostname.endsWith(".facebook.com");
-  if (url.protocol !== "https:" || !allowedHost || !url.pathname.startsWith("/marketplace/item/")) {
-    throw new Error("listing_url must be an HTTPS facebook.com Marketplace item URL.");
-  }
-  url.search = "";
-  url.hash = "";
-  return url.toString();
 }
 
 async function waitForMarketplace(page: Page): Promise<void> {
@@ -132,22 +119,69 @@ server.registerTool(
     description: "Search Marketplace and return a limited set of visible, read-only listing summaries.",
     inputSchema: {
       query: z.string().trim().min(1).max(120).describe("Marketplace search terms"),
+      location_slug: z
+        .string()
+        .trim()
+        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
+        .max(80)
+        .optional()
+        .describe("Optional Facebook Marketplace city slug, such as denver or colorado-springs"),
       min_price: z.number().nonnegative().optional().describe("Optional minimum price"),
       max_price: z.number().nonnegative().optional().describe("Optional maximum price"),
+      radius_miles: z
+        .union(supportedRadii.map((radius) => z.literal(radius)))
+        .optional()
+        .describe("Optional radius in miles around the selected Marketplace location"),
+      days_since_listed: z
+        .union([z.literal(1), z.literal(7), z.literal(30)])
+        .optional()
+        .describe("Only include items listed in the last 1, 7, or 30 days"),
+      conditions: z
+        .array(z.enum(["new", "used_like_new", "used_good", "used_fair"]))
+        .min(1)
+        .max(4)
+        .optional()
+        .describe("Optional item conditions"),
+      delivery_method: z
+        .enum(["local_pick_up", "shipping"])
+        .optional()
+        .describe("Optional delivery method"),
+      sort_by: z
+        .enum(["creation_time_descend", "distance_ascend", "price_ascend", "price_descend"])
+        .optional()
+        .describe("Optional result order"),
       limit: z.number().int().min(1).max(20).default(10).describe("Maximum listings to return"),
     },
     annotations: readOnlyAnnotations,
   },
-  async ({ query, min_price, max_price, limit }) => {
+  async ({
+    query,
+    location_slug,
+    min_price,
+    max_price,
+    radius_miles,
+    days_since_listed,
+    conditions,
+    delivery_method,
+    sort_by,
+    limit,
+  }) => {
     try {
       if (min_price !== undefined && max_price !== undefined && min_price > max_price) {
         throw new Error("min_price cannot be greater than max_price.");
       }
 
-      const searchUrl = new URL("/marketplace/search/", marketplaceOrigin);
-      searchUrl.searchParams.set("query", query);
-      if (min_price !== undefined) searchUrl.searchParams.set("minPrice", String(min_price));
-      if (max_price !== undefined) searchUrl.searchParams.set("maxPrice", String(max_price));
+      const searchUrl = buildMarketplaceSearchUrl({
+        query,
+        locationSlug: location_slug,
+        minPrice: min_price,
+        maxPrice: max_price,
+        radiusMiles: radius_miles,
+        daysSinceListed: days_since_listed,
+        conditions,
+        deliveryMethod: delivery_method,
+        sortBy: sort_by,
+      });
 
       const listings = await withPage(async (page) => {
         await page.goto(searchUrl.toString(), { waitUntil: "domcontentloaded" });
@@ -186,7 +220,21 @@ server.registerTool(
         );
       });
 
-      return jsonResult({ query, count: listings.length, listings });
+      return jsonResult({
+        query,
+        filters: {
+          locationSlug: location_slug,
+          minPrice: min_price,
+          maxPrice: max_price,
+          radiusMiles: radius_miles,
+          daysSinceListed: days_since_listed,
+          conditions,
+          deliveryMethod: delivery_method,
+          sortBy: sort_by,
+        },
+        count: listings.length,
+        listings,
+      });
     } catch (error) {
       return errorResult(error);
     }
@@ -235,14 +283,6 @@ server.registerTool(
     }
   },
 );
-
-async function shutdown(): Promise<void> {
-  const context = await contextPromise?.catch(() => undefined);
-  await context?.close().catch(() => undefined);
-}
-
-process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
-process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
