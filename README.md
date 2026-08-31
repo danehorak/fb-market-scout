@@ -7,6 +7,8 @@ A local, read-only MCP server that uses Playwright and a dedicated persistent Ch
 - Node.js 20 or newer
 - Chromium installed through Playwright
 
+With NVM, run `nvm use` in the project directory to select the version pinned in `.nvmrc`.
+
 ## Authenticate
 
 ```sh
