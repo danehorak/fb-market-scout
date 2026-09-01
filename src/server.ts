@@ -1,8 +1,6 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { chromium, type Locator, type Page } from "playwright";
+import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
 import { z } from "zod";
 import {
   assertMarketplaceListingUrl,
@@ -17,12 +15,18 @@ import {
   type ConversationRow,
 } from "./messages.js";
 import { RecentSendGuard } from "./send-guard.js";
+import { cdpEndpoint, profilePath } from "./browser-config.js";
 
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const profilePath = path.join(projectRoot, "data", "browser-profile");
 const supportedRadii = [1, 2, 5, 10, 20, 40, 60, 80, 100, 250, 500] as const;
 
 let operationQueue = Promise.resolve();
+type BrowserSession = {
+  context: BrowserContext;
+  externallyOwned: boolean;
+};
+let browserSessionPromise: Promise<BrowserSession> | undefined;
+let primaryPage: Page | undefined;
+let shuttingDown = false;
 const recentSendGuard = new RecentSendGuard(10 * 60 * 1_000);
 
 type ListingSummary = {
@@ -33,24 +37,81 @@ type ListingSummary = {
   imageAlt?: string;
 };
 
-async function withPage<T>(operation: (page: Page) => Promise<T>): Promise<T> {
-  const run = operationQueue.then(async () => {
+async function createBrowserSession(): Promise<BrowserSession> {
+  try {
+    const browser = await chromium.connectOverCDP(cdpEndpoint, { timeout: 1_500 });
+    const context = browser.contexts()[0];
+    if (!context) throw new Error("Shared Chromium did not expose its persistent context.");
+    browser.once("disconnected", () => {
+      if (!shuttingDown) {
+        browserSessionPromise = undefined;
+        primaryPage = undefined;
+      }
+    });
+    return { context, externallyOwned: true };
+  } catch {
     const context = await chromium.launchPersistentContext(profilePath, {
       headless: false,
       viewport: { width: 1440, height: 900 },
     });
-    try {
-      const page = context.pages()[0] ?? (await context.newPage());
-      return await operation(page);
-    } finally {
-      await context.close().catch(() => undefined);
-    }
+    const browser = context.browser();
+    browser?.once("disconnected", () => {
+      if (!shuttingDown) {
+        browserSessionPromise = undefined;
+        primaryPage = undefined;
+      }
+    });
+    return { context, externallyOwned: false };
+  }
+}
+
+async function getBrowserSession(): Promise<BrowserSession> {
+  if (!browserSessionPromise) {
+    browserSessionPromise = createBrowserSession();
+    browserSessionPromise
+      .catch(() => {
+        browserSessionPromise = undefined;
+        primaryPage = undefined;
+      });
+  }
+  return browserSessionPromise;
+}
+
+async function getPrimaryPage(): Promise<Page> {
+  const { context, externallyOwned } = await getBrowserSession();
+  if (!primaryPage || primaryPage.isClosed()) {
+    primaryPage = externallyOwned
+      ? await context.newPage()
+      : context.pages().find((page) => !page.isClosed()) ?? (await context.newPage());
+  }
+  return primaryPage;
+}
+
+async function withPage<T>(operation: (page: Page) => Promise<T>): Promise<T> {
+  const run = operationQueue.then(async () => {
+    if (shuttingDown) throw new Error("Marketplace browser session is shutting down.");
+    return operation(await getPrimaryPage());
   });
   operationQueue = run.then(
     () => undefined,
     () => undefined,
   );
   return run;
+}
+
+async function shutdownBrowser(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const sessionPromise = browserSessionPromise;
+  browserSessionPromise = undefined;
+  const page = primaryPage;
+  primaryPage = undefined;
+  const session = await sessionPromise?.catch(() => undefined);
+  if (session?.externallyOwned) {
+    await page?.close().catch(() => undefined);
+  } else {
+    await session?.context.close().catch(() => undefined);
+  }
 }
 
 function jsonResult(value: unknown) {
@@ -63,11 +124,11 @@ function errorResult(error: unknown) {
   const rawMessage = error instanceof Error ? error.message : String(error);
   let message = "Marketplace request failed. Check the local Chromium window and try again.";
   if (/existing browser session|processsingleton|profile.*in use/i.test(rawMessage)) {
-    message = "The dedicated browser profile is already in use. Close the login browser or wait for the other Marketplace tool call to finish.";
+    message = "The dedicated browser profile is already owned by another Chromium or fb-market-scout process. Close the other login browser or Codex session, then retry from one active MCP session.";
   } else if (/executable doesn't exist|browser.*not found/i.test(rawMessage)) {
     message = "Playwright Chromium is not installed. Run: npx playwright install chromium";
   } else if (/facebook is requesting login/i.test(rawMessage)) {
-    message = "Facebook is requesting login in the dedicated browser profile. Run: npm run login";
+    message = "Facebook is requesting login or verification. Complete it manually in the shared Chromium window, or run npm run login if that browser is not open.";
   } else if (error instanceof Error && !rawMessage.includes(profilePath)) {
     message = rawMessage;
   }
@@ -190,7 +251,7 @@ async function waitForSentMessage(page: Page, message: string, initialArticleCou
 
 const server = new McpServer({
   name: "fb-market-scout",
-  version: "0.3.0",
+  version: "0.4.0",
 });
 
 const readOnlyAnnotations = {
@@ -218,7 +279,7 @@ server.registerTool(
             marketplaceUrl: page.url().startsWith(`${marketplaceOrigin}/marketplace`),
             message: authenticated
               ? "The local browser profile appears to be authenticated."
-              : "Facebook is requesting login in the local browser profile. Run npm run login.",
+              : "Facebook is requesting login or verification. Complete it manually in the shared Chromium window, or run npm run login if that browser is not open.",
           };
         }),
       );
@@ -645,3 +706,7 @@ server.registerTool(
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+process.stdin.once("end", () => void shutdownBrowser().finally(() => process.exit(0)));
+process.once("SIGINT", () => void shutdownBrowser().finally(() => process.exit(0)));
+process.once("SIGTERM", () => void shutdownBrowser().finally(() => process.exit(0)));

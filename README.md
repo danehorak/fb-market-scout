@@ -17,9 +17,11 @@ npx playwright install chromium
 npm run login
 ```
 
-Log into Facebook in the Chromium window, confirm Marketplace loads, and then close the window. The session is stored under `data/browser-profile`, which is ignored by Git and must never be shared.
+Log into Facebook in the Chromium window and confirm Marketplace loads. Leave this one browser open while using fb-market-scout. The session is stored under `data/browser-profile`, which is ignored by Git and must never be shared.
 
-Only one process can use the profile at a time. Close the login browser before calling an MCP tool. The server opens Chromium for each tool call and closes it afterward so an idle Codex chat does not keep the profile locked.
+The login launcher exposes a Chromium DevTools Protocol endpoint only on `127.0.0.1`. MCP processes attach to that shared browser and use their own tabs, so searches, listing inspection, conversations, and approved sends do not repeatedly launch and close Chromium. If the shared browser is not running, the first MCP process falls back to launching one persistent browser for its own lifetime.
+
+Only one directly launched Chromium process may own the profile. Do not run `npm run login` twice. If an MCP process already launched the fallback browser, close that Codex session before starting the shared login browser.
 
 ## Run locally
 
@@ -39,7 +41,7 @@ Run this from a shell where `node --version` reports 20 or newer:
 codex mcp add fb-market-scout -- "$(nvm which 20)" "$(pwd)/dist/server.js"
 ```
 
-Then start a new Codex session and ask it to call `get_login_status`. The server exposes these read-only tools:
+Then start a new Codex session and ask it to call `get_login_status`. The server exposes these tools:
 
 - `get_login_status`
 - `search_marketplace`
@@ -73,7 +75,9 @@ These tools intentionally provide no bulk-recipient input and no automatic outre
 
 - Facebook can change its Marketplace markup without notice. If searches unexpectedly return no listings, confirm the same search works in the opened Chromium window.
 - Facebook may include sponsored or out-of-radius recommendations even when filters are present.
-- Tool calls are serialized within one MCP process. Chromium closes after every call, allowing other Codex sessions to use the profile afterward; simultaneous calls from separate sessions can still produce a temporary profile-in-use error.
+- Tool calls are serialized within each MCP process. When the shared login browser is running, separate MCP processes use separate tabs in that one browser. Avoid issuing simultaneous Facebook actions from multiple chats because cross-process navigation is not globally serialized.
+- The loopback CDP endpoint grants control of the authenticated browser to local processes that can reach it. It is intentionally bound to `127.0.0.1`; never expose or forward that port to another machine. Set `FB_MARKET_SCOUT_CDP_PORT` to another local port if `9222` is already occupied.
+- This project does not attempt to disguise Playwright, spoof browser fingerprints, imitate human timing, or bypass Facebook checkpoints. Stop automation and complete any Facebook verification manually if prompted.
 - Re-run `npm run login` if Facebook expires the saved session or requests verification.
 
 ## Safety

@@ -1,17 +1,14 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
-
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const profilePath = path.join(projectRoot, "data", "browser-profile");
+import { cdpEndpoint, profilePath, sharedBrowserArgs } from "./browser-config.js";
 
 async function main(): Promise<void> {
   console.log(`Using dedicated browser profile: ${profilePath}`);
+  console.log(`Local MCP browser endpoint: ${cdpEndpoint}`);
 
   const context = await chromium.launchPersistentContext(profilePath, {
     headless: false,
     viewport: null,
-    args: ["--start-maximized"],
+    args: ["--start-maximized", ...sharedBrowserArgs],
   });
   const browser = context.browser();
   if (!browser) {
@@ -49,7 +46,10 @@ Facebook Marketplace is open.
 1. Log into Facebook manually.
 2. Complete any verification Facebook requests.
 3. Confirm that Marketplace loads.
-4. Close the browser window when finished.
+4. Leave the browser window open while using fb-market-scout.
+
+Leave this browser open while using fb-market-scout. MCP sessions will attach to it through the loopback-only endpoint.
+Close it only when you are finished using Marketplace tools.
 
 Your authenticated session will remain in the ignored browser-profile directory.
 `);
