@@ -22,18 +22,27 @@ async function withClient(operation) {
   }
 }
 
-test("MCP server exposes only the expected read-only tools", async () => {
+test("MCP server exposes only the expected non-destructive tools", async () => {
   await withClient(async (client) => {
     const { tools } = await client.listTools();
 
     assert.deepEqual(
       tools.map(({ name }) => name).sort(),
-      ["get_listing", "get_login_status", "search_marketplace"],
+      [
+        "get_listing",
+        "get_login_status",
+        "get_marketplace_conversation",
+        "list_marketplace_conversations",
+        "search_marketplace",
+      ],
     );
-    for (const tool of tools) {
+    for (const tool of tools.filter(({ name }) => name !== "get_marketplace_conversation")) {
       assert.equal(tool.annotations?.readOnlyHint, true);
       assert.equal(tool.annotations?.destructiveHint, false);
     }
+    const conversation = tools.find(({ name }) => name === "get_marketplace_conversation");
+    assert.equal(conversation?.annotations?.readOnlyHint, false);
+    assert.equal(conversation?.annotations?.destructiveHint, false);
 
     const search = tools.find(({ name }) => name === "search_marketplace");
     assert.ok(search?.inputSchema.properties?.radius_miles);

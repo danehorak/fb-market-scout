@@ -9,6 +9,13 @@ import {
   buildMarketplaceSearchUrl,
   marketplaceOrigin,
 } from "./marketplace.js";
+import {
+  addConversationKeys,
+  extractSellerEvidence,
+  parseConversationRow,
+  parseMessageAccessibilityLine,
+  type ConversationRow,
+} from "./messages.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const profilePath = path.join(projectRoot, "data", "browser-profile");
@@ -95,9 +102,61 @@ async function waitForMarketplace(page: Page): Promise<boolean> {
   return foundListing;
 }
 
+type BrowserConversationRow = ConversationRow & { buttonIndex: number };
+
+async function openBuyingInbox(page: Page): Promise<ReturnType<Page["locator"]>> {
+  await page.goto(`${marketplaceOrigin}/marketplace/inbox/`, { waitUntil: "domcontentloaded" });
+  await requireLogin(page);
+  await page.keyboard.press("Escape");
+  const main = page.locator('[role="main"]');
+  const buyingTab = main.getByRole("tab", { name: "Buying", exact: true });
+  await buyingTab.waitFor({ timeout: 15_000 });
+  if ((await buyingTab.getAttribute("aria-selected")) !== "true") await buyingTab.click();
+  await page
+    .waitForFunction(() =>
+      [...document.querySelectorAll('[role="main"] [role="button"]')].some((button) =>
+        (button.textContent ?? "").includes("·"),
+      ),
+    { timeout: 15_000 })
+    .catch(() => undefined);
+  return main;
+}
+
+async function getConversationRows(main: ReturnType<Page["locator"]>): Promise<BrowserConversationRow[]> {
+  const candidates = await main.getByRole("button").evaluateAll((buttons) =>
+    buttons.map((button, buttonIndex) => ({
+      buttonIndex,
+      lines: (button instanceof HTMLElement ? button.innerText : button.textContent || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 8),
+    })),
+  );
+
+  return candidates.flatMap(({ buttonIndex, lines }) => {
+    const row = parseConversationRow(lines);
+    return row ? [{ ...row, buttonIndex }] : [];
+  });
+}
+
+function keyedBrowserRows(rows: BrowserConversationRow[]) {
+  const keyedRows = addConversationKeys(rows);
+  return keyedRows.map((row, index) => ({ ...row, buttonIndex: rows[index]!.buttonIndex }));
+}
+
+function marketplaceMessageAnnotations() {
+  return {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  };
+}
+
 const server = new McpServer({
   name: "fb-market-scout",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 const readOnlyAnnotations = {
@@ -309,6 +368,111 @@ server.registerTool(
       });
 
       return jsonResult({ url: safeUrl, ...listing });
+    } catch (error) {
+      return errorResult(error);
+    }
+  },
+);
+
+server.registerTool(
+  "list_marketplace_conversations",
+  {
+    title: "List Marketplace buying conversations",
+    description:
+      "List bounded summaries of Facebook Marketplace buying conversations without opening a thread.",
+    inputSchema: {
+      limit: z.number().int().min(1).max(30).default(15).describe("Maximum conversations to return"),
+    },
+    annotations: readOnlyAnnotations,
+  },
+  async ({ limit }) => {
+    try {
+      const conversations = await withPage(async (page) => {
+        const main = await openBuyingInbox(page);
+        return keyedBrowserRows(await getConversationRows(main))
+          .slice(0, limit)
+          .map(({ buttonIndex: _buttonIndex, ...summary }) => summary);
+      });
+      return jsonResult({ count: conversations.length, conversations });
+    } catch (error) {
+      return errorResult(error);
+    }
+  },
+);
+
+server.registerTool(
+  "get_marketplace_conversation",
+  {
+    title: "Read Marketplace buying conversation",
+    description:
+      "Open one Marketplace buying thread and return bounded structured messages. Opening it may mark the thread as read. This tool cannot send messages.",
+    inputSchema: {
+      conversation_key: z
+        .string()
+        .regex(/^[a-f0-9]{16}(?:-\d+)?$/)
+        .describe("Conversation key returned by list_marketplace_conversations"),
+      message_limit: z.number().int().min(1).max(50).default(30).describe("Maximum recent messages"),
+    },
+    annotations: marketplaceMessageAnnotations(),
+  },
+  async ({ conversation_key, message_limit }) => {
+    try {
+      const conversation = await withPage(async (page) => {
+        const main = await openBuyingInbox(page);
+        const rows = keyedBrowserRows(await getConversationRows(main));
+        const selected = rows.find((row) => row.conversationKey === conversation_key);
+        if (!selected) {
+          throw new Error(
+            "Conversation key was not found. Call list_marketplace_conversations again to refresh it.",
+          );
+        }
+
+        await main.getByRole("button").nth(selected.buttonIndex).click();
+        const log = page.locator('[role="log"]').first();
+        await log.waitFor({ timeout: 15_000 });
+        await page.waitForTimeout(1_000);
+
+        const thread = await log.evaluate((root, limit) => {
+          const accessibilityLines = [...root.querySelectorAll('[role="article"]')]
+            .map((article) =>
+              (article instanceof HTMLElement ? article.innerText : article.textContent || "")
+                .split("\n")
+                .map((line) => line.trim())
+                .find((line) => line.startsWith("Enter, Message sent ")),
+            )
+            .filter((line): line is string => Boolean(line))
+            .slice(-limit);
+
+          const itemPaths = [...document.querySelectorAll('a[href*="/marketplace/item/"]')]
+            .map((anchor) => (anchor instanceof HTMLAnchorElement ? new URL(anchor.href).pathname : ""))
+            .filter((pathname) => /^\/marketplace\/item\/\d+\/?$/.test(pathname));
+          const counts = new Map<string, number>();
+          for (const pathname of itemPaths) counts.set(pathname, (counts.get(pathname) ?? 0) + 1);
+          const listingPath = [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0];
+
+          return { accessibilityLines, listingPath };
+        }, message_limit);
+
+        const messages = thread.accessibilityLines
+          .map(parseMessageAccessibilityLine)
+          .filter((message) => message !== undefined);
+        const evidence = extractSellerEvidence(messages);
+        const listingUrl = thread.listingPath
+          ? new URL(thread.listingPath, marketplaceOrigin).toString()
+          : undefined;
+
+        return {
+          conversationKey: selected.conversationKey,
+          participant: selected.participant,
+          listingTitle: selected.listingTitle,
+          listingUrl,
+          openingMayMarkRead: true,
+          messageCount: messages.length,
+          messages,
+          sellerEvidence: evidence,
+        };
+      });
+      return jsonResult(conversation);
     } catch (error) {
       return errorResult(error);
     }

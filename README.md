@@ -1,6 +1,6 @@
 # fb-market-scout
 
-A local, read-only MCP server that uses Playwright and a dedicated persistent Chromium profile to inspect Facebook Marketplace listings.
+A local, read-focused MCP server that uses Playwright and a dedicated persistent Chromium profile to inspect Facebook Marketplace listings and buying conversations. It cannot send messages or modify listing content. Opening a conversation can cause Facebook to mark it as read.
 
 ## Requirements
 
@@ -44,10 +44,20 @@ Then start a new Codex session and ask it to call `get_login_status`. The server
 - `get_login_status`
 - `search_marketplace`
 - `get_listing`
+- `list_marketplace_conversations`
+- `get_marketplace_conversation`
 
 `search_marketplace` supports an optional Marketplace city slug; minimum and maximum prices; listing age; item condition; local pickup or shipping; newest, nearest, or price sorting; and a radius of 1, 2, 5, 10, 20, 40, 60, 80, 100, 250, or 500 miles. Without a city slug, searches use the location saved in the browser profile. Facebook treats radius filtering as a search preference and may occasionally include recommendations from outside it.
 
-The tools do not expose cookies or profile files and do not provide actions for messaging, buying, selling, saving, or modifying Facebook data.
+The tools do not expose cookies or profile files and do not provide actions for sending messages, buying, selling, saving, or modifying listing content.
+
+### Marketplace messages
+
+`list_marketplace_conversations` returns bounded summaries from the Marketplace Buying inbox. It does not open individual threads.
+
+`get_marketplace_conversation` accepts a conversation key from the list tool and returns recent rendered messages with sender attribution. It also returns seller-only evidence candidates containing availability language and likely product details such as model, serial, manufacturing, or year information. These candidates are quotations to evaluate, not guaranteed factual conclusions. Opening the conversation may mark it as read in Facebook, so this tool intentionally does not advertise MCP `readOnlyHint` even though it cannot send, react to, archive, or delete messages.
+
+Message content returned by the MCP server becomes part of the Codex or ChatGPT conversation that invoked the tool. The server does not save a separate message archive, but you should treat model conversation history and logs as private data.
 
 ## Operational notes
 
@@ -58,7 +68,7 @@ The tools do not expose cookies or profile files and do not provide actions for 
 
 ## Safety
 
-The MCP surface is intentionally narrow and read-only. Listing URLs are restricted to HTTPS Facebook Marketplace item paths, city slugs are validated before URL construction, result counts and extracted text are bounded, and all tools advertise MCP `readOnlyHint`. Never remove `data/browser-profile/` from `.gitignore` or share that directory.
+The MCP surface is intentionally narrow and non-posting. Listing URLs are restricted to HTTPS Facebook Marketplace item paths, city slugs are validated before URL construction, and result counts and extracted text are bounded. Search, listing, login-status, and conversation-list tools advertise MCP `readOnlyHint`; conversation reading is non-destructive but does not use that hint because Facebook may mark an opened thread as read. Never remove `data/browser-profile/` from `.gitignore` or share that directory.
 
 ## License
 
