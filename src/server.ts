@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { chromium, type Page } from "playwright";
+import { chromium, type Locator, type Page } from "playwright";
 import { z } from "zod";
 import {
   assertMarketplaceListingUrl,
@@ -16,12 +16,14 @@ import {
   parseMessageAccessibilityLine,
   type ConversationRow,
 } from "./messages.js";
+import { RecentSendGuard } from "./send-guard.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const profilePath = path.join(projectRoot, "data", "browser-profile");
 const supportedRadii = [1, 2, 5, 10, 20, 40, 60, 80, 100, 250, 500] as const;
 
 let operationQueue = Promise.resolve();
+const recentSendGuard = new RecentSendGuard(10 * 60 * 1_000);
 
 type ListingSummary = {
   url: string;
@@ -104,7 +106,7 @@ async function waitForMarketplace(page: Page): Promise<boolean> {
 
 type BrowserConversationRow = ConversationRow & { buttonIndex: number };
 
-async function openBuyingInbox(page: Page): Promise<ReturnType<Page["locator"]>> {
+async function openBuyingInbox(page: Page): Promise<Locator> {
   await page.goto(`${marketplaceOrigin}/marketplace/inbox/`, { waitUntil: "domcontentloaded" });
   await requireLogin(page);
   await page.keyboard.press("Escape");
@@ -122,7 +124,7 @@ async function openBuyingInbox(page: Page): Promise<ReturnType<Page["locator"]>>
   return main;
 }
 
-async function getConversationRows(main: ReturnType<Page["locator"]>): Promise<BrowserConversationRow[]> {
+async function getConversationRows(main: Locator): Promise<BrowserConversationRow[]> {
   const candidates = await main.getByRole("button").evaluateAll((buttons) =>
     buttons.map((button, buttonIndex) => ({
       buttonIndex,
@@ -154,9 +156,41 @@ function marketplaceMessageAnnotations() {
   };
 }
 
+const messageSendAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+
+async function firstVisible(locator: Locator): Promise<Locator> {
+  for (let index = 0; index < (await locator.count()); index += 1) {
+    const candidate = locator.nth(index);
+    if (await candidate.isVisible()) return candidate;
+  }
+  throw new Error("Facebook message composer is not available for this target.");
+}
+
+async function waitForSentMessage(page: Page, message: string, initialArticleCount: number): Promise<boolean> {
+  return page
+    .waitForFunction(
+      ({ expectedMessage, previousCount }) => {
+        const articles = [...document.querySelectorAll('[role="log"] [role="article"]')];
+        if (articles.length <= previousCount) return false;
+        return articles.slice(previousCount).some((article) =>
+          (article.textContent ?? "").includes(`by You: ${expectedMessage}`),
+        );
+      },
+      { expectedMessage: message, previousCount: initialArticleCount },
+      { timeout: 10_000 },
+    )
+    .then(() => true)
+    .catch(() => false);
+}
+
 const server = new McpServer({
   name: "fb-market-scout",
-  version: "0.2.0",
+  version: "0.3.0",
 });
 
 const readOnlyAnnotations = {
@@ -474,6 +508,136 @@ server.registerTool(
       });
       return jsonResult(conversation);
     } catch (error) {
+      return errorResult(error);
+    }
+  },
+);
+
+server.registerTool(
+  "send_marketplace_listing_message",
+  {
+    title: "Send one message about a Marketplace listing",
+    description:
+      "IRREVERSIBLE EXTERNAL ACTION: send exactly one user-approved message to the seller of one Marketplace listing. Never use for bulk or repeated outreach, and never retry automatically.",
+    inputSchema: {
+      listing_url: z.string().url().describe("HTTPS facebook.com Marketplace item URL"),
+      message: z.string().trim().min(1).max(1_000).describe("Exact message text approved by the user"),
+      confirm_send: z
+        .literal("SEND_THIS_EXACT_MESSAGE")
+        .describe("Required explicit confirmation for this exact recipient and message"),
+    },
+    annotations: messageSendAnnotations,
+  },
+  async ({ listing_url, message }) => {
+    let fingerprint: string | undefined;
+    try {
+      const safeUrl = assertMarketplaceListingUrl(listing_url);
+      fingerprint = recentSendGuard.reserve(safeUrl, message);
+      const result = await withPage(async (page) => {
+        await page.goto(safeUrl, { waitUntil: "domcontentloaded" });
+        await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
+        await requireLogin(page);
+
+        const main = page.locator('[role="main"]');
+        const composer = await firstVisible(main.locator("textarea"));
+        const sendButton = await firstVisible(
+          main.locator('[role="button"][aria-label^="Send message to "]'),
+        );
+        const recipientLabel = await sendButton.getAttribute("aria-label");
+        const recipient = recipientLabel?.replace(/^Send message to\s+/, "").trim() || undefined;
+        const title = await page
+          .locator('meta[property="og:title"]')
+          .getAttribute("content")
+          .catch(() => undefined);
+
+        await composer.fill(message);
+        if ((await composer.inputValue()) !== message) {
+          throw new Error("Facebook message composer did not retain the exact approved text.");
+        }
+
+        const initialArticleCount = await page.locator('[role="log"] [role="article"]').count();
+        await sendButton.click();
+        const confirmedInUi = await waitForSentMessage(page, message, initialArticleCount);
+
+        return {
+          sendActionPerformed: true,
+          confirmedInUi,
+          deliveryStatus: confirmedInUi ? "confirmed_in_facebook_ui" : "send_clicked_unconfirmed",
+          recipient,
+          listingTitle: title,
+          listingUrl: safeUrl,
+          message,
+          retryAttempted: false,
+        };
+      });
+      return jsonResult(result);
+    } catch (error) {
+      recentSendGuard.release(fingerprint);
+      return errorResult(error);
+    }
+  },
+);
+
+server.registerTool(
+  "send_marketplace_conversation_message",
+  {
+    title: "Send one Marketplace conversation message",
+    description:
+      "IRREVERSIBLE EXTERNAL ACTION: send exactly one user-approved follow-up in one existing Marketplace buying conversation. Never use for bulk or repeated outreach, and never retry automatically.",
+    inputSchema: {
+      conversation_key: z
+        .string()
+        .regex(/^[a-f0-9]{16}(?:-\d+)?$/)
+        .describe("Conversation key returned by list_marketplace_conversations"),
+      message: z.string().trim().min(1).max(1_000).describe("Exact message text approved by the user"),
+      confirm_send: z
+        .literal("SEND_THIS_EXACT_MESSAGE")
+        .describe("Required explicit confirmation for this exact recipient and message"),
+    },
+    annotations: messageSendAnnotations,
+  },
+  async ({ conversation_key, message }) => {
+    let fingerprint: string | undefined;
+    try {
+      fingerprint = recentSendGuard.reserve(conversation_key, message);
+      const result = await withPage(async (page) => {
+        const main = await openBuyingInbox(page);
+        const rows = keyedBrowserRows(await getConversationRows(main));
+        const selected = rows.find((row) => row.conversationKey === conversation_key);
+        if (!selected) {
+          throw new Error(
+            "Conversation key was not found. Call list_marketplace_conversations again to refresh it.",
+          );
+        }
+
+        await main.getByRole("button").nth(selected.buttonIndex).click();
+        const log = page.locator('[role="log"]').first();
+        await log.waitFor({ timeout: 15_000 });
+        const composer = await firstVisible(page.locator('[role="textbox"][contenteditable="true"]'));
+        const initialArticleCount = await log.locator('[role="article"]').count();
+
+        await composer.fill(message);
+        if ((await composer.textContent())?.trim() !== message) {
+          throw new Error("Facebook message composer did not retain the exact approved text.");
+        }
+
+        await composer.press("Enter");
+        const confirmedInUi = await waitForSentMessage(page, message, initialArticleCount);
+
+        return {
+          sendActionPerformed: true,
+          confirmedInUi,
+          deliveryStatus: confirmedInUi ? "confirmed_in_facebook_ui" : "send_submitted_unconfirmed",
+          conversationKey: selected.conversationKey,
+          recipient: selected.participant,
+          listingTitle: selected.listingTitle,
+          message,
+          retryAttempted: false,
+        };
+      });
+      return jsonResult(result);
+    } catch (error) {
+      recentSendGuard.release(fingerprint);
       return errorResult(error);
     }
   },

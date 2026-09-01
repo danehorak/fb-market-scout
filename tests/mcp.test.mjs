@@ -22,7 +22,7 @@ async function withClient(operation) {
   }
 }
 
-test("MCP server exposes only the expected non-destructive tools", async () => {
+test("MCP server exposes the expected tools and safety annotations", async () => {
   await withClient(async (client) => {
     const { tools } = await client.listTools();
 
@@ -34,20 +34,53 @@ test("MCP server exposes only the expected non-destructive tools", async () => {
         "get_marketplace_conversation",
         "list_marketplace_conversations",
         "search_marketplace",
+        "send_marketplace_conversation_message",
+        "send_marketplace_listing_message",
       ],
     );
-    for (const tool of tools.filter(({ name }) => name !== "get_marketplace_conversation")) {
+    const sendingToolNames = new Set([
+      "send_marketplace_conversation_message",
+      "send_marketplace_listing_message",
+    ]);
+    for (const tool of tools.filter(
+      ({ name }) => name !== "get_marketplace_conversation" && !sendingToolNames.has(name),
+    )) {
       assert.equal(tool.annotations?.readOnlyHint, true);
       assert.equal(tool.annotations?.destructiveHint, false);
     }
     const conversation = tools.find(({ name }) => name === "get_marketplace_conversation");
     assert.equal(conversation?.annotations?.readOnlyHint, false);
     assert.equal(conversation?.annotations?.destructiveHint, false);
+    for (const tool of tools.filter(({ name }) => sendingToolNames.has(name))) {
+      assert.equal(tool.annotations?.readOnlyHint, false);
+      assert.equal(tool.annotations?.destructiveHint, true);
+      assert.equal(tool.annotations?.idempotentHint, false);
+      assert.match(tool.description ?? "", /IRREVERSIBLE EXTERNAL ACTION/);
+      assert.equal(
+        tool.inputSchema.properties?.confirm_send?.const,
+        "SEND_THIS_EXACT_MESSAGE",
+      );
+    }
 
     const search = tools.find(({ name }) => name === "search_marketplace");
     assert.ok(search?.inputSchema.properties?.radius_miles);
     assert.ok(search?.inputSchema.properties?.location_slug);
     assert.ok(search?.inputSchema.properties?.sort_by);
+  });
+});
+
+test("send tool rejects missing confirmation without opening Chromium", async () => {
+  await withClient(async (client) => {
+    const result = await client.callTool({
+      name: "send_marketplace_listing_message",
+      arguments: {
+        listing_url: "https://www.facebook.com/marketplace/item/123456/",
+        message: "Is this available?",
+        confirm_send: "NO",
+      },
+    });
+
+    assert.equal(result.isError, true);
   });
 });
 
