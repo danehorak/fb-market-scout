@@ -77,7 +77,7 @@ These tools intentionally provide no bulk-recipient input and no automatic outre
 - Facebook may include sponsored or out-of-radius recommendations even when filters are present.
 - Tool calls are serialized within each MCP process. When the shared login browser is running, separate MCP processes use separate tabs in that one browser. Avoid issuing simultaneous Facebook actions from multiple chats because cross-process navigation is not globally serialized.
 - The loopback CDP endpoint grants control of the authenticated browser to local processes that can reach it. It is intentionally bound to `127.0.0.1`; never expose or forward that port to another machine. Set `FB_MARKET_SCOUT_CDP_PORT` to another local port if `9222` is already occupied.
-- This project does not attempt to disguise Playwright, spoof browser fingerprints, imitate human timing, or bypass Facebook checkpoints. Stop automation and complete any Facebook verification manually if prompted.
+- This project does not attempt to disguise Playwright, spoof browser fingerprints, imitate human timing, or bypass Facebook checkpoints. If Facebook shows login, checkpoint, CAPTCHA, or human-verification UI, the MCP brings that tab forward and pauses automation. Complete the prompt manually, then retry the tool.
 - Re-run `npm run login` if Facebook expires the saved session or requests verification.
 
 ## Safety

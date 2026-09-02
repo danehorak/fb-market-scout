@@ -16,6 +16,10 @@ import {
 } from "./messages.js";
 import { RecentSendGuard } from "./send-guard.js";
 import { cdpEndpoint, profilePath } from "./browser-config.js";
+import {
+  classifyManualIntervention,
+  type ManualInterventionReason,
+} from "./manual-intervention.js";
 
 const supportedRadii = [1, 2, 5, 10, 20, 40, 60, 80, 100, 250, 500] as const;
 
@@ -27,6 +31,7 @@ type BrowserSession = {
 let browserSessionPromise: Promise<BrowserSession> | undefined;
 let primaryPage: Page | undefined;
 let shuttingDown = false;
+let pausedForManualIntervention = false;
 const recentSendGuard = new RecentSendGuard(10 * 60 * 1_000);
 
 type ListingSummary = {
@@ -90,7 +95,13 @@ async function getPrimaryPage(): Promise<Page> {
 async function withPage<T>(operation: (page: Page) => Promise<T>): Promise<T> {
   const run = operationQueue.then(async () => {
     if (shuttingDown) throw new Error("Marketplace browser session is shutting down.");
-    return operation(await getPrimaryPage());
+    const page = await getPrimaryPage();
+    if (pausedForManualIntervention) {
+      const reason = await detectManualIntervention(page);
+      if (reason) await pauseForManualIntervention(page, reason);
+      pausedForManualIntervention = false;
+    }
+    return operation(page);
   });
   operationQueue = run.then(
     () => undefined,
@@ -138,19 +149,36 @@ function errorResult(error: unknown) {
   };
 }
 
-async function isLoginRequired(page: Page): Promise<boolean> {
-  const loginFormVisible = await page
-    .locator('input[name="email"], form[action*="login"]')
-    .first()
-    .isVisible()
-    .catch(() => false);
-  return loginFormVisible || page.url().includes("/login") || page.url().includes("/checkpoint/");
+async function detectManualIntervention(page: Page): Promise<ManualInterventionReason | undefined> {
+  const state = await page.evaluate(() => ({
+    visibleText: document.body?.innerText.slice(0, 8_000) ?? "",
+    hasCaptchaFrame: Boolean(
+      document.querySelector('iframe[src*="captcha" i], iframe[title*="captcha" i]'),
+    ),
+    hasLoginForm: Boolean(document.querySelector('input[name="email"], form[action*="login"]')),
+  }));
+  return classifyManualIntervention(
+    page.url(),
+    state.visibleText,
+    state.hasCaptchaFrame,
+    state.hasLoginForm,
+  );
+}
+
+async function pauseForManualIntervention(
+  page: Page,
+  reason: ManualInterventionReason,
+): Promise<never> {
+  pausedForManualIntervention = true;
+  await page.bringToFront().catch(() => undefined);
+  throw new Error(
+    `Manual Facebook interaction required (${reason}). Automation is paused; complete the prompt in the focused Chromium tab and retry afterward.`,
+  );
 }
 
 async function requireLogin(page: Page): Promise<void> {
-  if (await isLoginRequired(page)) {
-    throw new Error("Facebook is requesting login.");
-  }
+  const reason = await detectManualIntervention(page);
+  if (reason) await pauseForManualIntervention(page, reason);
 }
 
 async function waitForMarketplace(page: Page): Promise<boolean> {
@@ -251,7 +279,7 @@ async function waitForSentMessage(page: Page, message: string, initialArticleCou
 
 const server = new McpServer({
   name: "fb-market-scout",
-  version: "0.4.0",
+  version: "0.4.1",
 });
 
 const readOnlyAnnotations = {
@@ -273,10 +301,16 @@ server.registerTool(
       return jsonResult(
         await withPage(async (page) => {
           await page.goto(`${marketplaceOrigin}/marketplace/`, { waitUntil: "domcontentloaded" });
-          const authenticated = !(await isLoginRequired(page));
+          const manualInterventionReason = await detectManualIntervention(page);
+          if (manualInterventionReason) {
+            pausedForManualIntervention = true;
+            await page.bringToFront().catch(() => undefined);
+          }
+          const authenticated = !manualInterventionReason;
           return {
             authenticated,
             marketplaceUrl: page.url().startsWith(`${marketplaceOrigin}/marketplace`),
+            manualInterventionReason,
             message: authenticated
               ? "The local browser profile appears to be authenticated."
               : "Facebook is requesting login or verification. Complete it manually in the shared Chromium window, or run npm run login if that browser is not open.",
